@@ -21,6 +21,14 @@ type ProxyCtx struct {
 	Dialer func(ctx context.Context, network string, addr string) (net.Conn, error)
 	// will contain the recent error that occurred while trying to send receive or parse traffic
 	Error error
+	// HTTP/2 stream context populated during H2 MITM hook processing.
+	H2StreamID  uint32
+	H2Direction H2Direction
+	H2Headers   http.Header
+	GrpcMethod  string
+	// HTTP/1.1 chunked transfer context populated during chunk hook processing.
+	ChunkIndex     int
+	ChunkDirection ChunkDirection
 	// A handle for the user to keep data in the context, from the call of ReqHandler to the
 	// call of RespHandler
 	UserData any

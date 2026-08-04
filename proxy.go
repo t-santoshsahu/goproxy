@@ -26,9 +26,13 @@ type ProxyHttpServer struct {
 	// i.e. requests with a relative path (e.g. GET /ping) instead of an absolute URL.
 	// Defaults to a handler that returns HTTP 500 with an explanatory message.
 	NonproxyHandler http.Handler
-	reqHandlers     []ReqHandler
-	respHandlers    []RespHandler
-	httpsHandlers   []HttpsHandler
+	reqHandlers        []ReqHandler
+	respHandlers       []RespHandler
+	httpsHandlers      []HttpsHandler
+	h2StreamHandlers   []H2StreamHandler
+	grpcStreamHandlers []GrpcMessageHandler
+	respChunkHandlers  []ChunkHandler
+	reqChunkHandlers   []ChunkHandler
 	// Tr is the http.Transport used to send requests to destination servers.
 	// Defaults to a transport that skips TLS verification and reads proxy settings from environment variables.
 	Tr *http.Transport
@@ -104,6 +108,30 @@ func (proxy *ProxyHttpServer) filterResponse(respOrig *http.Response, ctx *Proxy
 		resp = h.Handle(resp, ctx)
 	}
 	return
+}
+
+func (proxy *ProxyHttpServer) filterH2Stream(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error) {
+	out := event
+	for _, h := range proxy.h2StreamHandlers {
+		var err error
+		out, err = h.HandleH2Stream(out, ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (proxy *ProxyHttpServer) filterGrpcMessage(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+	out := msg
+	for _, h := range proxy.grpcStreamHandlers {
+		var err error
+		out, err = h.HandleGrpcMessage(out, streamID, dir, endStream, ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // RemoveProxyHeaders removes all proxy headers which should not propagate to the next hop.

@@ -22,6 +22,10 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 			RemoveProxyHeaders(ctx, r)
 		}
 
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = proxy.wrapChunkHookBody(r.Body, r.Header, r.TransferEncoding, ctx, ChunkFromClient)
+		}
+
 		var err error
 		resp, err = ctx.RoundTrip(r)
 		if err != nil {
@@ -37,6 +41,10 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	}
 
 	resp = proxy.filterResponse(resp, ctx)
+
+	if resp != nil && resp.Body != nil && resp.Body != http.NoBody {
+		resp.Body = proxy.wrapChunkHookBody(resp.Body, resp.Header, resp.TransferEncoding, ctx, ChunkFromServer)
+	}
 
 	if resp == nil {
 		var errorString string
@@ -104,6 +112,7 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	}
 
 	nr, err := io.Copy(copyWriter, resp.Body)
+	applyChunkTrailers(resp)
 	if err := resp.Body.Close(); err != nil {
 		ctx.Warnf("Can't close response body %v", err)
 	}

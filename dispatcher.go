@@ -294,6 +294,24 @@ func (pcond *ReqProxyConds) HandleConnectFunc(f func(host string, ctx *ProxyCtx)
 	pcond.HandleConnect(FuncHttpsHandler(f))
 }
 
+// OnChunkFunc registers a function as a request ChunkHandler when all conditions match.
+func (pcond *ReqProxyConds) OnChunkFunc(f func(event *ChunkEvent, ctx *ProxyCtx) (*ChunkEvent, error)) {
+	pcond.OnChunk(FuncChunkHandler(f))
+}
+
+// OnChunk registers a ChunkHandler for request bodies when all conditions match.
+func (pcond *ReqProxyConds) OnChunk(h ChunkHandler) {
+	pcond.proxy.reqChunkHandlers = append(pcond.proxy.reqChunkHandlers,
+		FuncChunkHandler(func(event *ChunkEvent, ctx *ProxyCtx) (*ChunkEvent, error) {
+			for _, cond := range pcond.reqConds {
+				if !cond.HandleReq(ctx.Req, ctx) {
+					return event, nil
+				}
+			}
+			return h.HandleChunk(event, ctx)
+		}))
+}
+
 // HijackConnect registers a handler that takes full control of the raw net.Conn
 // for CONNECT requests that match the aggregated conditions.
 // The handler receives the original HTTP request, the raw client connection, and the proxy context.
@@ -344,6 +362,29 @@ func (pcond *ProxyConds) Do(h RespHandler) {
 		}))
 }
 
+// OnChunkFunc registers a function as a response ChunkHandler when all conditions match.
+func (pcond *ProxyConds) OnChunkFunc(f func(event *ChunkEvent, ctx *ProxyCtx) (*ChunkEvent, error)) {
+	pcond.OnChunk(FuncChunkHandler(f))
+}
+
+// OnChunk registers a ChunkHandler for response bodies when all conditions match.
+func (pcond *ProxyConds) OnChunk(h ChunkHandler) {
+	pcond.proxy.respChunkHandlers = append(pcond.proxy.respChunkHandlers,
+		FuncChunkHandler(func(event *ChunkEvent, ctx *ProxyCtx) (*ChunkEvent, error) {
+			for _, cond := range pcond.reqConds {
+				if !cond.HandleReq(ctx.Req, ctx) {
+					return event, nil
+				}
+			}
+			for _, cond := range pcond.respCond {
+				if !cond.HandleResp(ctx.Resp, ctx) {
+					return event, nil
+				}
+			}
+			return h.HandleChunk(event, ctx)
+		}))
+}
+
 // OnResponse is used when adding a response-filter to the HTTP proxy, usual pattern is
 //
 //	proxy.OnResponse(cond1,cond2).Do(handler) // handler.Handle(resp,ctx) will be used
@@ -384,4 +425,62 @@ func HandleBytes(f func(b []byte, ctx *ProxyCtx) []byte) RespHandler {
 		resp.Body = io.NopCloser(bytes.NewBuffer(f(b, ctx)))
 		return resp
 	})
+}
+
+// H2StreamConds aggregate H2StreamConditions for a ProxyHttpServer.
+type H2StreamConds struct {
+	proxy *ProxyHttpServer
+	conds []H2StreamCondition
+}
+
+// OnH2Stream returns a builder for registering HTTP/2 stream handlers.
+func (proxy *ProxyHttpServer) OnH2Stream(conds ...H2StreamCondition) *H2StreamConds {
+	return &H2StreamConds{proxy: proxy, conds: conds}
+}
+
+// DoFunc registers a function as an H2StreamHandler when all conditions match.
+func (pcond *H2StreamConds) DoFunc(f func(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error)) {
+	pcond.Do(FuncH2StreamHandler(f))
+}
+
+// Do registers an H2StreamHandler when all conditions match.
+func (pcond *H2StreamConds) Do(h H2StreamHandler) {
+	pcond.proxy.h2StreamHandlers = append(pcond.proxy.h2StreamHandlers,
+		FuncH2StreamHandler(func(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error) {
+			for _, cond := range pcond.conds {
+				if !cond.HandleH2Stream(ctx.H2Headers, ctx) {
+					return event, nil
+				}
+			}
+			return h.HandleH2Stream(event, ctx)
+		}))
+}
+
+// GrpcStreamConds aggregate H2StreamConditions for gRPC stream handlers.
+type GrpcStreamConds struct {
+	proxy *ProxyHttpServer
+	conds []H2StreamCondition
+}
+
+// OnGrpcStream returns a builder for registering gRPC message handlers.
+func (proxy *ProxyHttpServer) OnGrpcStream(conds ...H2StreamCondition) *GrpcStreamConds {
+	return &GrpcStreamConds{proxy: proxy, conds: conds}
+}
+
+// DoFunc registers a function as a GrpcMessageHandler when all conditions match.
+func (pcond *GrpcStreamConds) DoFunc(f func(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error)) {
+	pcond.Do(FuncGrpcMessageHandler(f))
+}
+
+// Do registers a GrpcMessageHandler when all conditions match.
+func (pcond *GrpcStreamConds) Do(h GrpcMessageHandler) {
+	pcond.proxy.grpcStreamHandlers = append(pcond.proxy.grpcStreamHandlers,
+		FuncGrpcMessageHandler(func(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+			for _, cond := range pcond.conds {
+				if !cond.HandleH2Stream(ctx.H2Headers, ctx) {
+					return msg, nil
+				}
+			}
+			return h.HandleGrpcMessage(msg, streamID, dir, endStream, ctx)
+		}))
 }

@@ -37,12 +37,15 @@ the proxy CA certificate, to avoid any certificate issue in the clients.
 - Redirect normal HTTP traffic to a `custom handler`, when the target is a `relative path` (e.g. `/ping`)
 - You can choose the logger to use, by implementing the `Logger` interface
 - You can `disable` the HTTP request headers `canonicalization`, by setting `PreventCanonicalization` to true
+- Intercept and modify **HTTP/2 streams** and **gRPC messages** during HTTPS MITM (requires `AllowHTTP2 = true`)
 
 ## Proxy modes
 1. Regular HTTP proxy
 2. HTTPS through CONNECT
 3. HTTPS MITM ("Man in the Middle") proxy server, in which the server generate TLS certificates to parse request/response data and perform actions on them
-4. "Hijacked" proxy connection, where the configured handler can access the raw net.Conn data
+4. **HTTP/2 MITM** — when a MITM'd client sends an HTTP/2 connection preface (`PRI * HTTP/2.0`), the proxy relays the H2 session and can invoke stream-level hooks to inspect or modify headers and data
+5. **gRPC stream interception** — built on HTTP/2 hooks; individual gRPC messages are deframed, passed to handlers, and reframed on the wire
+6. "Hijacked" proxy connection, where the configured handler can access the raw net.Conn data
 
 ## Sponsors
 Does your company use GoProxy? Help us keep the project maintained and healthy!
@@ -194,7 +197,7 @@ cover the most common cases. Take a look at them and good luck!
 
 ## Request & Response manipulation
 
-There are 3  different types of handlers to manipulate the behavior of the proxy, as follows:
+There are several handler types to manipulate the behavior of the proxy, as follows:
 
 ```go
 // handler called after receiving HTTP CONNECT from the client, and
@@ -206,7 +209,13 @@ reqHandlers     []ReqHandler
 
 // handler called after proxy receives HTTP Response from destination host,
 // and before proxy forwards the Response to the client
-respHandlers    []RespHandler 
+respHandlers    []RespHandler
+
+// handler called for each HTTP/2 stream header block or DATA frame during MITM
+h2StreamHandlers   []H2StreamHandler
+
+// handler called for each gRPC message (after 5-byte deframing) on a gRPC stream
+grpcStreamHandlers []GrpcMessageHandler
 ```
 
 Depending on what you want to manipulate, the ways to add handlers to each of the previous lists are:
@@ -220,6 +229,16 @@ proxy.OnRequest(some ReqConditions).Do(YourReqHandlerFunc())
 
 // Add handlers to respHandlers
 proxy.OnResponse(some RespConditions).Do(YourRespHandlerFunc())
+
+// Add handlers to h2StreamHandlers (HTTP/2 stream headers and data)
+proxy.OnH2Stream(some H2StreamConditions).Do(YourH2StreamHandlerFunc())
+
+// Add handlers to grpcStreamHandlers (individual gRPC messages)
+proxy.OnGrpcStream(some H2StreamConditions).Do(YourGrpcMessageHandlerFunc())
+
+// Add handlers to respChunkHandlers / reqChunkHandlers (HTTP/1.1 chunked bodies)
+proxy.OnResponse(some RespConditions).OnChunk(YourChunkHandlerFunc())
+proxy.OnRequest(some ReqConditions).OnChunk(YourChunkHandlerFunc())
 ```
 
 Example:
@@ -240,6 +259,151 @@ proxy.OnRequest(goproxy.UrlMatches(regexp.MustCompile(`.*gif$`))).HandleConnect(
 // an HTTP request using URL.Path (target path) as a condition.
 proxy.OnRequest(goproxy.UrlMatches(regexp.MustCompile(`.*gif$`))).Do(YourReqHandlerFunc())
 ```
+
+## HTTP/2 and gRPC stream hooks
+
+HTTP/2 traffic is handled during **HTTPS MITM**. When a client opens an HTTP/2 session over a MITM'd TLS connection, goproxy can decode stream headers and data, invoke your handlers, and forward modified frames to the destination.
+
+> **Requirements**
+> - Set `proxy.AllowHTTP2 = true` (disabled by default)
+> - Enable MITM on CONNECT, e.g. `proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)`
+> - Trust the proxy CA certificate in the client (same as any other MITM use case)
+
+When no H2 or gRPC handlers are registered, the proxy uses a fast blind frame relay (unchanged behaviour). Hooks are only activated once you register at least one handler via `OnH2Stream()` or `OnGrpcStream()`.
+
+### Basic HTTP/2 setup
+
+```go
+package main
+
+import (
+    "log"
+    "net/http"
+
+    "github.com/elazarl/goproxy"
+)
+
+func main() {
+    proxy := goproxy.NewProxyHttpServer()
+    proxy.Verbose = true
+    proxy.AllowHTTP2 = true
+    proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+
+    // Log every HTTP/2 stream header block
+    proxy.OnH2Stream().DoFunc(func(event *goproxy.H2StreamEvent, ctx *goproxy.ProxyCtx) (*goproxy.H2StreamEvent, error) {
+        if event.Headers != nil {
+            ctx.Logf("H2 stream %d dir=%d :method=%s :path=%s",
+                event.StreamID, event.Direction,
+                event.Headers.Get(":method"), event.Headers.Get(":path"))
+        }
+        return event, nil
+    })
+
+    log.Fatal(http.ListenAndServe(":8080", proxy))
+}
+```
+
+### Intercept HTTP/2 stream data
+
+`H2StreamEvent` carries either decoded **headers** (`event.Headers != nil`) or **data** (`event.Data != nil`) for a single stream. Return the modified event to rewrite what is sent on the wire.
+
+```go
+proxy.OnH2Stream(goproxy.H2MethodIs("POST")).DoFunc(
+    func(event *goproxy.H2StreamEvent, ctx *goproxy.ProxyCtx) (*goproxy.H2StreamEvent, error) {
+        if event.Data != nil {
+            // Prefix every outbound data chunk on matching streams
+            event.Data = append([]byte("intercepted:"), event.Data...)
+        }
+        return event, nil
+    })
+```
+
+During hook callbacks, `ctx` exposes stream metadata:
+
+| Field | Description |
+|-------|-------------|
+| `ctx.H2StreamID` | HTTP/2 stream ID |
+| `ctx.H2Direction` | `goproxy.H2FromClient` or `goproxy.H2FromServer` |
+| `ctx.H2Headers` | Decoded headers for the current stream |
+| `ctx.GrpcMethod` | gRPC method path (`:path` pseudo-header) on gRPC streams |
+
+### HTTP/2 stream conditions
+
+Conditions work like `OnRequest` filters, but match against decoded H2 headers:
+
+```go
+proxy.OnH2Stream(
+    goproxy.H2HostIs("api.example.com"),
+    goproxy.H2PathMatches(regexp.MustCompile(`^/v1/`)),
+).DoFunc(...)
+```
+
+Available conditions:
+
+- `H2PathMatches(re)` — match the `:path` pseudo-header
+- `H2MethodIs("POST", ...)` — match the `:method` pseudo-header
+- `H2HostIs("example.com")` — match the `:authority` pseudo-header
+- `IsGrpcStream()` — match streams with `content-type: application/grpc`
+
+### gRPC message hooks
+
+On gRPC streams, `OnGrpcStream()` handlers receive **individual messages** after the 5-byte gRPC framing (compressed flag + length) is stripped. Return modified bytes to rewrite the message; the proxy reframes them automatically.
+
+```go
+proxy.OnGrpcStream(goproxy.IsGrpcStream()).DoFunc(
+    func(msg []byte, streamID uint32, dir goproxy.H2Direction, endStream bool, ctx *goproxy.ProxyCtx) ([]byte, error) {
+        ctx.Logf("gRPC %s stream %d: %d bytes (end=%v)", ctx.GrpcMethod, streamID, len(msg), endStream)
+        return msg, nil
+    })
+```
+
+Use `OnH2Stream()` when you need to inspect raw HTTP/2 headers or non-gRPC DATA frames. Use `OnGrpcStream()` when you want per-message access on `application/grpc` streams.
+
+## Chunked transfer encoding hooks
+
+HTTP/1.1 chunked transfer encoding hooks let you inspect and modify individual chunks on request or response bodies. Handlers receive **decoded chunk payloads** (chunk framing removed). The proxy exposes the modified payload as a plain byte stream; downstream consumers (`io.Copy`, `http.ResponseWriter`, or `resp.Write` in MITM) re-apply chunked encoding when appropriate.
+
+> **Note:** Go's default `http.Transport` decodes chunked response bodies before they reach goproxy, so chunk hooks on upstream responses normally require a custom `RoundTripper` that preserves wire-format chunked bodies, or supplying a raw chunked body from a request/response handler. When the body is still in wire-format (e.g. MITM with a raw connection, or `bodyLooksChunked` auto-detection), hooks parse each chunk and invoke your handlers.
+
+When no chunk handlers are registered, bodies pass through unchanged.
+
+### Registering chunk handlers
+
+```go
+// Response chunks (server → client)
+proxy.OnResponse(goproxy.StatusCodeIs(200)).OnChunkFunc(
+    func(event *goproxy.ChunkEvent, ctx *goproxy.ProxyCtx) (*goproxy.ChunkEvent, error) {
+        if len(event.Data) > 0 {
+            event.Data = bytes.ToUpper(event.Data)
+        }
+        return event, nil
+    })
+
+// Request chunks (client → server)
+proxy.OnRequest(goproxy.UrlIs("/upload")).OnChunkFunc(
+    func(event *goproxy.ChunkEvent, ctx *goproxy.ProxyCtx) (*goproxy.ChunkEvent, error) {
+        ctx.Logf("request chunk %d: %d bytes (last=%v)", event.Index, len(event.Data), event.IsLast)
+        return event, nil
+    })
+```
+
+During hook callbacks, `ctx` exposes chunk metadata:
+
+| Field | Description |
+|-------|-------------|
+| `ctx.ChunkIndex` | Zero-based index of the current chunk |
+| `ctx.ChunkDirection` | `goproxy.ChunkFromClient` or `goproxy.ChunkFromServer` |
+
+`ChunkEvent` fields:
+
+| Field | Description |
+|-------|-------------|
+| `event.Data` | Decoded chunk payload (empty on the terminating chunk) |
+| `event.Index` | Same as `ctx.ChunkIndex` |
+| `event.IsLast` | `true` for the zero-size terminating chunk |
+| `event.Trailers` | Trailer headers following the last chunk (when present) |
+
+Return `nil` for `event.Data` on a non-last chunk to **skip** that chunk. Return an error to abort the read.
 
 ## Error handling
 ### Generic error

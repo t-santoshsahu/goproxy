@@ -1,14 +1,11 @@
 package goproxy
 
 import (
-	"bufio"
-	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
 	"net/http"
-	"strings"
 
 	"golang.org/x/net/http2"
 )
@@ -22,76 +19,19 @@ type H2Transport struct {
 	ClientReader io.Reader
 	ClientWriter io.Writer
 	TLSConfig    *tls.Config
+	UpstreamTLS  *tls.Config
 	Host         string
+	Proxy        *ProxyHttpServer
+	Ctx          *ProxyCtx
+	Dial         func(network, addr string) (net.Conn, error)
 }
 
 // RoundTrip executes an HTTP/2 session (including all contained streams).
 // The request and response are ignored but any error encountered during the
 // proxying from the session is returned as a result of the invocation.
 func (r *H2Transport) RoundTrip(_ *http.Request) (*http.Response, error) {
-	raddr := r.Host
-	if !strings.Contains(raddr, ":") {
-		raddr += ":443"
-	}
-	rawServerTLS, err := dial("tcp", raddr)
-	if err != nil {
-		return nil, err
-	}
-	defer rawServerTLS.Close()
-	// Ensure that we only advertise HTTP/2 as the accepted protocol.
-	r.TLSConfig.NextProtos = []string{http2.NextProtoTLS}
-	// Initiate TLS and check remote host name against certificate.
-	rawServerTLS = tls.Client(rawServerTLS, r.TLSConfig)
-	rawTLSConn, ok := rawServerTLS.(*tls.Conn)
-	if !ok {
-		return nil, errors.New("invalid TLS connection")
-	}
-	if err = rawTLSConn.HandshakeContext(context.Background()); err != nil {
-		return nil, err
-	}
-	if r.TLSConfig == nil || !r.TLSConfig.InsecureSkipVerify {
-		if err = rawTLSConn.VerifyHostname(raddr[:strings.LastIndex(raddr, ":")]); err != nil {
-			return nil, err
-		}
-	}
-	// Send new client preface to match the one parsed in req.
-	if _, err := io.WriteString(rawServerTLS, http2.ClientPreface); err != nil {
-		return nil, err
-	}
-	serverTLSReader := bufio.NewReader(rawServerTLS)
-	cToS := http2.NewFramer(rawServerTLS, r.ClientReader)
-	sToC := http2.NewFramer(r.ClientWriter, serverTLSReader)
-	errSToC := make(chan error)
-	errCToS := make(chan error)
-	go func() {
-		for {
-			if err := proxyFrame(sToC); err != nil {
-				errSToC <- err
-				break
-			}
-		}
-	}()
-	go func() {
-		for {
-			if err := proxyFrame(cToS); err != nil {
-				errCToS <- err
-				break
-			}
-		}
-	}()
-	for i := 0; i < 2; i++ {
-		select {
-		case err := <-errSToC:
-			if !errors.Is(err, io.EOF) {
-				return nil, err
-			}
-		case err := <-errCToS:
-			if !errors.Is(err, io.EOF) {
-				return nil, err
-			}
-		}
-	}
-	return nil, nil
+	session := newH2Session(r)
+	return nil, session.run()
 }
 
 func dial(network, addr string) (c net.Conn, err error) {
@@ -110,6 +50,10 @@ func proxyFrame(fr *http2.Framer) error {
 	if err != nil {
 		return err
 	}
+	return relayFrame(fr, f)
+}
+
+func relayFrame(fr *http2.Framer, f http2.Frame) error {
 	switch f.Header().Type {
 	case http2.FrameData:
 		tf, ok := f.(*http2.DataFrame)
@@ -149,7 +93,7 @@ func proxyFrame(fr *http2.Framer) error {
 		if !ok {
 			return ErrInvalidH2Frame
 		}
-		return fr.WriteGoAway(tf.StreamID, tf.ErrCode, tf.DebugData())
+		return fr.WriteGoAway(tf.LastStreamID, tf.ErrCode, tf.DebugData())
 	case http2.FramePing:
 		tf, ok := f.(*http2.PingFrame)
 		if !ok {
@@ -171,9 +115,6 @@ func proxyFrame(fr *http2.Framer) error {
 			return fr.WriteSettingsAck()
 		}
 		var settings []http2.Setting
-		// NOTE: If we want to parse headers, need to handle
-		// settings where s.ID == http2.SettingHeaderTableSize and
-		// accordingly update the Framer options.
 		for i := 0; i < tf.NumSettings(); i++ {
 			settings = append(settings, tf.Setting(i))
 		}

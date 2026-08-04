@@ -346,7 +346,23 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 								ctx.Warnf("HTTP2 connection failed: disallowed")
 								return false
 							}
-							tr := H2Transport{reader, client, tlsConfig, host}
+							upstreamTLS := proxy.Tr.TLSClientConfig
+							if upstreamTLS == nil {
+								upstreamTLS = tlsClientSkipVerify
+							}
+							upstreamTLS = upstreamTLS.Clone()
+							tr := H2Transport{
+								ClientReader: reader,
+								ClientWriter: client,
+								TLSConfig:    tlsConfig,
+								UpstreamTLS:  upstreamTLS,
+								Host:         host,
+								Proxy:        proxy,
+								Ctx:          ctx,
+								Dial: func(network, addr string) (net.Conn, error) {
+									return proxy.connectDial(ctx, network, addr)
+								},
+							}
 							if _, err := tr.RoundTrip(req); err != nil {
 								ctx.Warnf("HTTP2 connection failed: %v", err)
 							} else {
@@ -365,6 +381,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						if !proxy.KeepHeader {
 							RemoveProxyHeaders(ctx, req)
 						}
+						if req.Body != nil && req.Body != http.NoBody {
+							req.Body = proxy.wrapChunkHookBody(req.Body, req.Header, req.TransferEncoding, ctx, ChunkFromClient)
+						}
 						resp, err = ctx.RoundTrip(req)
 						if err != nil {
 							ctx.Warnf("Cannot read response from mitm'd server %v", err)
@@ -374,6 +393,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					}
 					origBody := resp.Body
 					resp = proxy.filterResponse(resp, ctx)
+					if resp.Body != nil && resp.Body != http.NoBody {
+						resp.Body = proxy.wrapChunkHookBody(resp.Body, resp.Header, resp.TransferEncoding, ctx, ChunkFromServer)
+					}
 					bodyModified := resp.Body != origBody
 					defer resp.Body.Close()
 					if resp.Body != http.NoBody && (bodyModified ||
