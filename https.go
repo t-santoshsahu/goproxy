@@ -17,6 +17,7 @@ import (
 
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
+	"golang.org/x/net/http2"
 )
 
 // ConnectActionLiteral defines the action the proxy should take
@@ -119,18 +120,20 @@ func stripPort(s string) string {
 }
 
 func (proxy *ProxyHttpServer) dial(ctx *ProxyCtx, network, addr string) (c net.Conn, err error) {
-	if ctx.Dialer != nil {
-		return ctx.Dialer(ctx.Req.Context(), network, addr)
+	reqCtx := context.Background()
+	if ctx != nil && ctx.Req != nil {
+		reqCtx = ctx.Req.Context()
+		if ctx.Dialer != nil {
+			return ctx.Dialer(reqCtx, network, addr)
+		}
 	}
 
 	if proxy.Tr != nil && proxy.Tr.DialContext != nil {
-		return proxy.Tr.DialContext(ctx.Req.Context(), network, addr)
+		return proxy.Tr.DialContext(reqCtx, network, addr)
 	}
 
-	// if the user didn't specify any dialer, we just use the default one,
-	// provided by net package
 	var d net.Dialer
-	return d.DialContext(ctx.Req.Context(), network, addr)
+	return d.DialContext(reqCtx, network, addr)
 }
 
 func (proxy *ProxyHttpServer) connectDial(ctx *ProxyCtx, network, addr string) (c net.Conn, err error) {
@@ -278,6 +281,54 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
 					ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
 					return
+				}
+
+				if proxy.AllowHTTP2 {
+					if tlsConn, ok := client.(*tls.Conn); ok && tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+						upstreamTLS := proxy.Tr.TLSClientConfig
+						if upstreamTLS == nil {
+							upstreamTLS = tlsClientSkipVerify
+						}
+						upstreamTLS = upstreamTLS.Clone()
+						var h2Req *http.Request
+						if ctx.Req != nil {
+							h2Req = ctx.Req.WithContext(context.WithoutCancel(ctx.Req.Context()))
+						}
+						upstreamServerName := tlsConn.ConnectionState().ServerName
+						preface := make([]byte, len(http2.ClientPreface))
+						if _, err := io.ReadFull(client, preface); err != nil {
+							ctx.Warnf("Failed to read HTTP2 client preface: %v", err)
+							return
+						}
+						if string(preface) != http2.ClientPreface {
+							ctx.Warnf("Invalid HTTP2 client preface from client")
+							return
+						}
+						h2Ctx := &ProxyCtx{
+							Req:          h2Req,
+							Session:      atomic.AddInt64(&proxy.sess, 1),
+							Proxy:        proxy,
+							UserData:     ctx.UserData,
+							RoundTripper: ctx.RoundTripper,
+						}
+						tr := H2Transport{
+							ClientReader:       client,
+							ClientWriter:       client,
+							TLSConfig:          tlsConfig,
+							UpstreamTLS:        upstreamTLS,
+							UpstreamServerName: upstreamServerName,
+							Host:               host,
+							Proxy:              proxy,
+							Ctx:                h2Ctx,
+							Dial: func(network, addr string) (net.Conn, error) {
+								return proxy.connectDial(h2Ctx, network, addr)
+							},
+						}
+						if _, err := tr.RoundTrip(nil); err != nil {
+							h2Ctx.Warnf("HTTP2 ALPN connection failed: %v", err)
+						}
+						return
+					}
 				}
 			}
 

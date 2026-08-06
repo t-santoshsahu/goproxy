@@ -968,22 +968,25 @@ func TestHttpsMitmURLRewrite(t *testing.T) {
 func TestSimpleHttpRequest(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 
-	var server *http.Server
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("Cannot listen:", err)
+	}
+	addr := ln.Addr().String()
+
+	server := &http.Server{
+		Handler:           proxy,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
-		t.Log("serving end proxy server at localhost:5000")
-		server = &http.Server{
-			Addr:              "localhost:5000",
-			Handler:           proxy,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		err := server.ListenAndServe()
-		if err == nil {
-			t.Error("Error shutdown should always return error", err)
+		t.Logf("serving end proxy server at %s", addr)
+		err := server.Serve(ln)
+		if err != nil && err != http.ErrServerClosed {
+			t.Error("proxy server error:", err)
 		}
 	}()
 
-	time.Sleep(1 * time.Second)
-	u, _ := url.Parse("http://localhost:5000")
+	u, _ := url.Parse("http://" + addr)
 	tr := &http.Transport{
 		Proxy: http.ProxyURL(u),
 		// Disable HTTP/2.
@@ -1000,7 +1003,7 @@ func TestSimpleHttpRequest(t *testing.T) {
 	if err != nil {
 		t.Error("Error requesting http site", err)
 	} else if resp.StatusCode != http.StatusOK {
-		t.Error("Non-OK status requesting http site", err)
+		t.Errorf("Non-OK status requesting http site: %d", resp.StatusCode)
 	}
 
 	req, err = http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.invalid", nil)

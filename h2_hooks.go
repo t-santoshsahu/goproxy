@@ -119,10 +119,11 @@ type h2StreamState struct {
 }
 
 type h2Session struct {
-	proxy        *ProxyHttpServer
-	ctx          *ProxyCtx
-	host         string
-	upstreamTLS  *tls.Config
+	proxy              *ProxyHttpServer
+	ctx                *ProxyCtx
+	host               string
+	upstreamServerName string
+	upstreamTLS        *tls.Config
 	dial         func(network, addr string) (net.Conn, error)
 	clientReader io.Reader
 	clientWriter io.Writer
@@ -141,10 +142,11 @@ type h2Session struct {
 
 func newH2Session(tr *H2Transport) *h2Session {
 	s := &h2Session{
-		proxy:        tr.Proxy,
-		ctx:          tr.Ctx,
-		host:         tr.Host,
-		upstreamTLS:  tr.UpstreamTLS,
+		proxy:              tr.Proxy,
+		ctx:                tr.Ctx,
+		host:               tr.Host,
+		upstreamServerName: tr.UpstreamServerName,
+		upstreamTLS:        tr.UpstreamTLS,
 		dial:         tr.Dial,
 		clientReader: tr.ClientReader,
 		clientWriter: tr.ClientWriter,
@@ -182,6 +184,11 @@ func (s *h2Session) run() error {
 		tlsConfig = tlsConfig.Clone()
 	}
 	tlsConfig.NextProtos = []string{http2.NextProtoTLS}
+	serverName := s.upstreamServerName
+	if serverName == "" {
+		serverName = raddr[:strings.LastIndex(raddr, ":")]
+	}
+	tlsConfig.ServerName = serverName
 	rawServerTLS = tls.Client(rawServerTLS, tlsConfig)
 	rawTLSConn, ok := rawServerTLS.(*tls.Conn)
 	if !ok {
@@ -191,7 +198,7 @@ func (s *h2Session) run() error {
 		return err
 	}
 	if tlsConfig == nil || !tlsConfig.InsecureSkipVerify {
-		if err = rawTLSConn.VerifyHostname(raddr[:strings.LastIndex(raddr, ":")]); err != nil {
+		if err = rawTLSConn.VerifyHostname(serverName); err != nil {
 			return err
 		}
 	}

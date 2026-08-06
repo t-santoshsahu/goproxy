@@ -16,14 +16,15 @@ var ErrInvalidH2Frame = errors.New("invalid H2 frame")
 // HTTP/2 session, sending all client frames to the server and responses back
 // to the client.
 type H2Transport struct {
-	ClientReader io.Reader
-	ClientWriter io.Writer
-	TLSConfig    *tls.Config
-	UpstreamTLS  *tls.Config
-	Host         string
-	Proxy        *ProxyHttpServer
-	Ctx          *ProxyCtx
-	Dial         func(network, addr string) (net.Conn, error)
+	ClientReader       io.Reader
+	ClientWriter       io.Writer
+	TLSConfig          *tls.Config
+	UpstreamTLS        *tls.Config
+	UpstreamServerName string
+	Host               string
+	Proxy              *ProxyHttpServer
+	Ctx                *ProxyCtx
+	Dial               func(network, addr string) (net.Conn, error)
 }
 
 // RoundTrip executes an HTTP/2 session (including all contained streams).
