@@ -18,20 +18,18 @@ func isGrpcContentType(ct string) bool {
 
 // GrpcMessageHandler can inspect or modify individual gRPC messages on a stream.
 type GrpcMessageHandler interface {
-	HandleGrpcMessage(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error)
+	HandleGrpcMessage(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error)
 }
 
 // FuncGrpcMessageHandler adapts a function to GrpcMessageHandler.
-type FuncGrpcMessageHandler func(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error)
+type FuncGrpcMessageHandler func(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error)
 
-func (f FuncGrpcMessageHandler) HandleGrpcMessage(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error) {
-	return f(msg, streamID, dir, endStream, ctx)
+func (f FuncGrpcMessageHandler) HandleGrpcMessage(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+	return f(stream, msg, endStream, ctx)
 }
 
 // processGrpcData deframes 5-byte gRPC messages, invokes handlers, and reframes output.
-// The returned bool is true when the payload was modified or reframed.
-// An empty output with modified false means data was buffered waiting for more bytes.
-func processGrpcData(data []byte, state *h2StreamState, proxy *ProxyHttpServer, ctx *ProxyCtx, streamID uint32, dir H2Direction, endStream bool) ([]byte, bool, error) {
+func processGrpcData(data []byte, state *h2StreamState, proxy *ProxyHttpServer, ctx *ProxyCtx, stream *H2Stream, endStream bool) ([]byte, bool, error) {
 	if proxy == nil || len(proxy.grpcStreamHandlers) == 0 {
 		return data, false, nil
 	}
@@ -53,7 +51,7 @@ func processGrpcData(data []byte, state *h2StreamState, proxy *ProxyHttpServer, 
 		state.grpcBuf = state.grpcBuf[totalLen:]
 
 		msgEndStream := endStream && len(state.grpcBuf) == 0
-		newMsg, err := proxy.filterGrpcMessage(msg, streamID, dir, msgEndStream, ctx)
+		newMsg, err := proxy.filterGrpcMessage(stream, msg, msgEndStream, ctx)
 		if err != nil {
 			return nil, false, err
 		}

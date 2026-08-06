@@ -42,14 +42,14 @@ type H2StreamEvent struct {
 
 // H2StreamHandler can inspect or modify HTTP/2 stream headers and data.
 type H2StreamHandler interface {
-	HandleH2Stream(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error)
+	HandleH2Stream(stream *H2Stream, ctx *ProxyCtx) (*H2StreamEvent, error)
 }
 
 // FuncH2StreamHandler adapts a function to H2StreamHandler.
-type FuncH2StreamHandler func(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error)
+type FuncH2StreamHandler func(stream *H2Stream, ctx *ProxyCtx) (*H2StreamEvent, error)
 
-func (f FuncH2StreamHandler) HandleH2Stream(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error) {
-	return f(event, ctx)
+func (f FuncH2StreamHandler) HandleH2Stream(stream *H2Stream, ctx *ProxyCtx) (*H2StreamEvent, error) {
+	return f(stream, ctx)
 }
 
 // H2StreamCondition decides whether a registered handler applies to a stream.
@@ -132,8 +132,9 @@ type h2Session struct {
 
 	maxFrameSize uint32
 
-	streams   map[uint32]*h2StreamState
-	streamsMu sync.Mutex
+	streams        map[uint32]*h2StreamState
+	streamObjects  map[uint32]*H2Stream
+	streamsMu      sync.Mutex
 
 	blindRelay bool
 }
@@ -150,7 +151,8 @@ func newH2Session(tr *H2Transport) *h2Session {
 		clientDec:    hpack.NewDecoder(defaultHpackTableSize, nil),
 		serverDec:    hpack.NewDecoder(defaultHpackTableSize, nil),
 		maxFrameSize: defaultMaxFrameSize,
-		streams:      make(map[uint32]*h2StreamState),
+		streams:       make(map[uint32]*h2StreamState),
+		streamObjects: make(map[uint32]*H2Stream),
 	}
 	if s.upstreamTLS == nil {
 		s.upstreamTLS = tr.TLSConfig
@@ -255,9 +257,7 @@ func (s *h2Session) streamState(streamID uint32) *h2StreamState {
 }
 
 func (s *h2Session) deleteStream(streamID uint32) {
-	s.streamsMu.Lock()
-	delete(s.streams, streamID)
-	s.streamsMu.Unlock()
+	s.deleteH2Stream(streamID)
 }
 
 func (s *h2Session) proxyFrame(fr *http2.Framer, dir H2Direction) error {
@@ -350,15 +350,6 @@ func (s *h2Session) handleHeaders(fr *http2.Framer, tf *http2.HeadersFrame, dir 
 
 	if ct := st.headers.Get("content-type"); isGrpcContentType(ct) {
 		st.isGrpc = true
-		if s.ctx != nil {
-			s.ctx.GrpcMethod = st.headers.Get(":path")
-		}
-	}
-
-	if s.ctx != nil {
-		s.ctx.H2StreamID = tf.StreamID
-		s.ctx.H2Direction = dir
-		s.ctx.H2Headers = st.headers.Clone()
 	}
 
 	endStream := tf.StreamEnded()
@@ -366,7 +357,7 @@ func (s *h2Session) handleHeaders(fr *http2.Framer, tf *http2.HeadersFrame, dir 
 	streamID := tf.StreamID
 
 	if s.hasH2Handlers() {
-		outHeaders, outEndStream, err := s.invokeH2HeaderHook(streamID, dir, endStream, st.headers)
+		outHeaders, outEndStream, err := s.invokeH2HeaderHook(st, streamID, dir, endStream, st.headers)
 		if err != nil {
 			return err
 		}
@@ -418,21 +409,12 @@ func (s *h2Session) handleContinuation(fr *http2.Framer, tf *http2.ContinuationF
 
 	if ct := st.headers.Get("content-type"); isGrpcContentType(ct) {
 		st.isGrpc = true
-		if s.ctx != nil {
-			s.ctx.GrpcMethod = st.headers.Get(":path")
-		}
-	}
-
-	if s.ctx != nil {
-		s.ctx.H2StreamID = tf.StreamID
-		s.ctx.H2Direction = dir
-		s.ctx.H2Headers = st.headers.Clone()
 	}
 
 	streamID := tf.StreamID
 
 	if s.hasH2Handlers() {
-		outHeaders, _, err := s.invokeH2HeaderHook(streamID, dir, false, st.headers)
+		outHeaders, _, err := s.invokeH2HeaderHook(st, streamID, dir, false, st.headers)
 		if err != nil {
 			return err
 		}
@@ -452,7 +434,9 @@ func (s *h2Session) handleData(fr *http2.Framer, tf *http2.DataFrame, dir H2Dire
 	endStream := tf.StreamEnded()
 
 	if st.isGrpc && s.proxy != nil && len(s.proxy.grpcStreamHandlers) > 0 {
-		out, _, err := processGrpcData(data, st, s.proxy, s.ctx, tf.StreamID, dir, endStream)
+		stream := s.h2Stream(tf.StreamID, st, dir, data, endStream)
+		s.populateH2Ctx(stream)
+		out, _, err := processGrpcData(data, st, s.proxy, s.ctx, stream, endStream)
 		if err != nil {
 			return err
 		}
@@ -467,7 +451,7 @@ func (s *h2Session) handleData(fr *http2.Framer, tf *http2.DataFrame, dir H2Dire
 	}
 
 	if s.hasH2Handlers() {
-		out, err := s.invokeH2DataHook(tf.StreamID, dir, endStream, data)
+		out, err := s.invokeH2DataHook(st, tf.StreamID, dir, endStream, data)
 		if err != nil {
 			return err
 		}
@@ -488,21 +472,26 @@ func (s *h2Session) hasH2Handlers() bool {
 	return s.proxy != nil && len(s.proxy.h2StreamHandlers) > 0
 }
 
-func (s *h2Session) invokeH2HeaderHook(streamID uint32, dir H2Direction, endStream bool, headers http.Header) (http.Header, bool, error) {
-	if s.ctx != nil {
-		s.ctx.H2StreamID = streamID
-		s.ctx.H2Direction = dir
-		s.ctx.H2Headers = headers.Clone()
+func (s *h2Session) populateH2Ctx(stream *H2Stream) {
+	if s.ctx == nil {
+		return
 	}
-
-	event := &H2StreamEvent{
-		StreamID:  streamID,
-		Direction: dir,
-		EndStream: endStream,
-		Headers:   headers.Clone(),
+	s.ctx.H2Stream = stream
+	s.ctx.H2StreamID = stream.ID
+	s.ctx.H2Direction = stream.Direction()
+	if stream.Headers != nil {
+		s.ctx.H2Headers = stream.Headers.Clone()
 	}
+	if stream.IsGrpc {
+		s.ctx.GrpcMethod = stream.GrpcMethod()
+	}
+}
 
-	out, err := s.proxy.filterH2Stream(event, s.ctx)
+func (s *h2Session) invokeH2HeaderHook(st *h2StreamState, streamID uint32, dir H2Direction, endStream bool, headers http.Header) (http.Header, bool, error) {
+	stream := s.h2Stream(streamID, st, dir, nil, endStream)
+	s.populateH2Ctx(stream)
+
+	out, err := s.proxy.filterH2Stream(stream, s.ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -515,23 +504,11 @@ func (s *h2Session) invokeH2HeaderHook(streamID uint32, dir H2Direction, endStre
 	return out.Headers, out.EndStream, nil
 }
 
-func (s *h2Session) invokeH2DataHook(streamID uint32, dir H2Direction, endStream bool, data []byte) ([]byte, error) {
-	if s.ctx != nil {
-		s.ctx.H2StreamID = streamID
-		s.ctx.H2Direction = dir
-		if st := s.streamState(streamID); st.headers != nil {
-			s.ctx.H2Headers = st.headers.Clone()
-		}
-	}
+func (s *h2Session) invokeH2DataHook(st *h2StreamState, streamID uint32, dir H2Direction, endStream bool, data []byte) ([]byte, error) {
+	stream := s.h2Stream(streamID, st, dir, data, endStream)
+	s.populateH2Ctx(stream)
 
-	event := &H2StreamEvent{
-		StreamID:  streamID,
-		Direction: dir,
-		EndStream: endStream,
-		Data:      data,
-	}
-
-	out, err := s.proxy.filterH2Stream(event, s.ctx)
+	out, err := s.proxy.filterH2Stream(stream, s.ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -22,6 +22,7 @@ type ProxyCtx struct {
 	// will contain the recent error that occurred while trying to send receive or parse traffic
 	Error error
 	// HTTP/2 stream context populated during H2 MITM hook processing.
+	H2Stream    *H2Stream
 	H2StreamID  uint32
 	H2Direction H2Direction
 	H2Headers   http.Header

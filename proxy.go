@@ -110,23 +110,27 @@ func (proxy *ProxyHttpServer) filterResponse(respOrig *http.Response, ctx *Proxy
 	return
 }
 
-func (proxy *ProxyHttpServer) filterH2Stream(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error) {
+func (proxy *ProxyHttpServer) filterH2Stream(stream *H2Stream, ctx *ProxyCtx) (*H2StreamEvent, error) {
+	event := stream.Event()
 	out := event
 	for _, h := range proxy.h2StreamHandlers {
 		var err error
-		out, err = h.HandleH2Stream(out, ctx)
+		out, err = h.HandleH2Stream(stream, ctx)
 		if err != nil {
 			return nil, err
+		}
+		if out == nil {
+			out = event
 		}
 	}
 	return out, nil
 }
 
-func (proxy *ProxyHttpServer) filterGrpcMessage(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+func (proxy *ProxyHttpServer) filterGrpcMessage(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error) {
 	out := msg
 	for _, h := range proxy.grpcStreamHandlers {
 		var err error
-		out, err = h.HandleGrpcMessage(out, streamID, dir, endStream, ctx)
+		out, err = h.HandleGrpcMessage(stream, out, endStream, ctx)
 		if err != nil {
 			return nil, err
 		}

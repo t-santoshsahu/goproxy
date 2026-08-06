@@ -290,13 +290,12 @@ func main() {
     proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 
     // Log every HTTP/2 stream header block
-    proxy.OnH2Stream().DoFunc(func(event *goproxy.H2StreamEvent, ctx *goproxy.ProxyCtx) (*goproxy.H2StreamEvent, error) {
-        if event.Headers != nil {
+    proxy.OnH2Stream().DoFunc(func(stream *goproxy.H2Stream, ctx *goproxy.ProxyCtx) (*goproxy.H2StreamEvent, error) {
+        if stream.Data() == nil {
             ctx.Logf("H2 stream %d dir=%d :method=%s :path=%s",
-                event.StreamID, event.Direction,
-                event.Headers.Get(":method"), event.Headers.Get(":path"))
+                stream.ID, stream.Direction(), stream.Method(), stream.Path())
         }
-        return event, nil
+        return stream.Event(), nil
     })
 
     log.Fatal(http.ListenAndServe(":8080", proxy))
@@ -305,27 +304,35 @@ func main() {
 
 ### Intercept HTTP/2 stream data
 
-`H2StreamEvent` carries either decoded **headers** (`event.Headers != nil`) or **data** (`event.Data != nil`) for a single stream. Return the modified event to rewrite what is sent on the wire.
+Handlers receive an `*H2Stream` object that persists for the lifetime of the stream. Use `stream.UserData` to store per-stream state across header and data callbacks. Return a modified `*H2StreamEvent` (from `stream.Event()`) to rewrite what is sent on the wire.
 
 ```go
 proxy.OnH2Stream(goproxy.H2MethodIs("POST")).DoFunc(
-    func(event *goproxy.H2StreamEvent, ctx *goproxy.ProxyCtx) (*goproxy.H2StreamEvent, error) {
-        if event.Data != nil {
-            // Prefix every outbound data chunk on matching streams
+    func(stream *goproxy.H2Stream, ctx *goproxy.ProxyCtx) (*goproxy.H2StreamEvent, error) {
+        if len(stream.Data()) > 0 {
+            event := stream.Event()
             event.Data = append([]byte("intercepted:"), event.Data...)
+            return event, nil
         }
-        return event, nil
+        return stream.Event(), nil
     })
 ```
 
-During hook callbacks, `ctx` exposes stream metadata:
+`H2Stream` accessors:
 
-| Field | Description |
-|-------|-------------|
-| `ctx.H2StreamID` | HTTP/2 stream ID |
-| `ctx.H2Direction` | `goproxy.H2FromClient` or `goproxy.H2FromServer` |
-| `ctx.H2Headers` | Decoded headers for the current stream |
-| `ctx.GrpcMethod` | gRPC method path (`:path` pseudo-header) on gRPC streams |
+| Method | Description |
+|--------|-------------|
+| `stream.ID` | HTTP/2 stream ID |
+| `stream.Headers` | Decoded header fields for this stream |
+| `stream.Direction()` | `goproxy.H2FromClient` or `goproxy.H2FromServer` |
+| `stream.Data()` | Current DATA frame payload (nil on header events) |
+| `stream.EndStream()` | Whether the current event ends the stream |
+| `stream.Method()` / `stream.Path()` / `stream.Authority()` | Pseudo-header helpers |
+| `stream.IsGrpc` / `stream.GrpcMethod()` | gRPC stream detection and method path |
+| `stream.UserData` | Per-stream storage across callbacks |
+| `stream.Event()` | Build an `H2StreamEvent` for the current callback |
+
+During hook callbacks, `ctx.H2Stream` also references the current stream (along with `ctx.H2StreamID`, `ctx.H2Direction`, `ctx.H2Headers`, and `ctx.GrpcMethod`).
 
 ### HTTP/2 stream conditions
 
@@ -351,8 +358,8 @@ On gRPC streams, `OnGrpcStream()` handlers receive **individual messages** after
 
 ```go
 proxy.OnGrpcStream(goproxy.IsGrpcStream()).DoFunc(
-    func(msg []byte, streamID uint32, dir goproxy.H2Direction, endStream bool, ctx *goproxy.ProxyCtx) ([]byte, error) {
-        ctx.Logf("gRPC %s stream %d: %d bytes (end=%v)", ctx.GrpcMethod, streamID, len(msg), endStream)
+    func(stream *goproxy.H2Stream, msg []byte, endStream bool, ctx *goproxy.ProxyCtx) ([]byte, error) {
+        ctx.Logf("gRPC %s stream %d: %d bytes (end=%v)", stream.GrpcMethod(), stream.ID, len(msg), endStream)
         return msg, nil
     })
 ```

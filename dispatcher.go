@@ -439,20 +439,24 @@ func (proxy *ProxyHttpServer) OnH2Stream(conds ...H2StreamCondition) *H2StreamCo
 }
 
 // DoFunc registers a function as an H2StreamHandler when all conditions match.
-func (pcond *H2StreamConds) DoFunc(f func(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error)) {
+func (pcond *H2StreamConds) DoFunc(f func(stream *H2Stream, ctx *ProxyCtx) (*H2StreamEvent, error)) {
 	pcond.Do(FuncH2StreamHandler(f))
 }
 
 // Do registers an H2StreamHandler when all conditions match.
 func (pcond *H2StreamConds) Do(h H2StreamHandler) {
 	pcond.proxy.h2StreamHandlers = append(pcond.proxy.h2StreamHandlers,
-		FuncH2StreamHandler(func(event *H2StreamEvent, ctx *ProxyCtx) (*H2StreamEvent, error) {
+		FuncH2StreamHandler(func(stream *H2Stream, ctx *ProxyCtx) (*H2StreamEvent, error) {
+			headers := stream.Headers
+			if headers == nil && ctx.H2Headers != nil {
+				headers = ctx.H2Headers
+			}
 			for _, cond := range pcond.conds {
-				if !cond.HandleH2Stream(ctx.H2Headers, ctx) {
-					return event, nil
+				if !cond.HandleH2Stream(headers, ctx) {
+					return stream.Event(), nil
 				}
 			}
-			return h.HandleH2Stream(event, ctx)
+			return h.HandleH2Stream(stream, ctx)
 		}))
 }
 
@@ -468,19 +472,23 @@ func (proxy *ProxyHttpServer) OnGrpcStream(conds ...H2StreamCondition) *GrpcStre
 }
 
 // DoFunc registers a function as a GrpcMessageHandler when all conditions match.
-func (pcond *GrpcStreamConds) DoFunc(f func(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error)) {
+func (pcond *GrpcStreamConds) DoFunc(f func(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error)) {
 	pcond.Do(FuncGrpcMessageHandler(f))
 }
 
 // Do registers a GrpcMessageHandler when all conditions match.
 func (pcond *GrpcStreamConds) Do(h GrpcMessageHandler) {
 	pcond.proxy.grpcStreamHandlers = append(pcond.proxy.grpcStreamHandlers,
-		FuncGrpcMessageHandler(func(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+		FuncGrpcMessageHandler(func(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+			headers := stream.Headers
+			if headers == nil && ctx.H2Headers != nil {
+				headers = ctx.H2Headers
+			}
 			for _, cond := range pcond.conds {
-				if !cond.HandleH2Stream(ctx.H2Headers, ctx) {
+				if !cond.HandleH2Stream(headers, ctx) {
 					return msg, nil
 				}
 			}
-			return h.HandleGrpcMessage(msg, streamID, dir, endStream, ctx)
+			return h.HandleGrpcMessage(stream, msg, endStream, ctx)
 		}))
 }

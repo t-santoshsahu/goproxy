@@ -26,7 +26,7 @@ func TestIsGrpcContentType(t *testing.T) {
 
 func TestProcessGrpcData(t *testing.T) {
 	proxy := NewProxyHttpServer()
-	proxy.OnGrpcStream().DoFunc(func(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+	proxy.OnGrpcStream().DoFunc(func(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error) {
 		out := make([]byte, len(msg))
 		copy(out, msg)
 		for i := range out {
@@ -41,10 +41,12 @@ func TestProcessGrpcData(t *testing.T) {
 		return append(hdr, msg...)
 	}
 
+	stream := &H2Stream{ID: 1, IsGrpc: true, Headers: make(map[string][]string)}
+	stream.bind(H2FromClient, nil, false)
 	state := &h2StreamState{isGrpc: true}
-	ctx := &ProxyCtx{Proxy: proxy}
+	ctx := &ProxyCtx{Proxy: proxy, H2Stream: stream}
 
-	out, modified, err := processGrpcData(frame([]byte("hello")), state, proxy, ctx, 1, H2FromClient, true)
+	out, modified, err := processGrpcData(frame([]byte("hello")), state, proxy, ctx, stream, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,15 +66,17 @@ func TestProcessGrpcData(t *testing.T) {
 
 func TestProcessGrpcDataBuffersPartialMessage(t *testing.T) {
 	proxy := NewProxyHttpServer()
-	proxy.OnGrpcStream().DoFunc(func(msg []byte, streamID uint32, dir H2Direction, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+	proxy.OnGrpcStream().DoFunc(func(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error) {
 		return msg, nil
 	})
 
+	stream := &H2Stream{ID: 1, IsGrpc: true}
+	stream.bind(H2FromClient, nil, false)
 	state := &h2StreamState{isGrpc: true}
-	ctx := &ProxyCtx{Proxy: proxy}
+	ctx := &ProxyCtx{Proxy: proxy, H2Stream: stream}
 
 	partial := []byte{0, 0, 0, 0, 10, 'h', 'i'}
-	out, modified, err := processGrpcData(partial, state, proxy, ctx, 1, H2FromClient, false)
+	out, modified, err := processGrpcData(partial, state, proxy, ctx, stream, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,5 +85,29 @@ func TestProcessGrpcDataBuffersPartialMessage(t *testing.T) {
 	}
 	if len(state.grpcBuf) != len(partial) {
 		t.Fatalf("expected buffer length %d, got %d", len(partial), len(state.grpcBuf))
+	}
+}
+
+func TestFilterGrpcMessageUsesStream(t *testing.T) {
+	proxy := NewProxyHttpServer()
+	var gotPath string
+	proxy.OnGrpcStream().DoFunc(func(stream *H2Stream, msg []byte, endStream bool, ctx *ProxyCtx) ([]byte, error) {
+		gotPath = stream.Path()
+		return msg, nil
+	})
+
+	stream := &H2Stream{
+		ID:      5,
+		IsGrpc:  true,
+		Headers: map[string][]string{":path": {"/svc.Method"}},
+	}
+	stream.bind(H2FromClient, nil, true)
+	ctx := &ProxyCtx{Proxy: proxy, H2Stream: stream}
+
+	if _, err := proxy.filterGrpcMessage(stream, []byte("x"), true, ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/svc.Method" {
+		t.Fatalf("Path = %q", gotPath)
 	}
 }
