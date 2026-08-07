@@ -123,30 +123,35 @@ type prependReadCloser struct {
 
 // bodyLooksChunked peeks at the first line of body to detect wire-format chunked encoding.
 // When true, returns a new ReadCloser that replays the peeked bytes.
+// When false, also returns a ReadCloser that replays peeked bytes — the original
+// reader must not be returned after the peek or those bytes are lost.
 func bodyLooksChunked(r io.ReadCloser) (bool, io.ReadCloser) {
 	br := bufio.NewReader(r)
 	line, err := br.ReadSlice('\n')
+	replay := &prependReadCloser{
+		Reader: io.MultiReader(bytes.NewReader(line), br),
+		Closer: r,
+	}
 	if err != nil {
-		return false, r
+		// Incomplete first line (EOF without '\n', or buffer full) cannot be a
+		// chunk-size line. Replay whatever was read.
+		return false, replay
 	}
 	trimmed := bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte("\r"))
 	if len(trimmed) == 0 {
-		return false, r
+		return false, replay
 	}
 	end := 0
 	for end < len(trimmed) && isHex(trimmed[end]) {
 		end++
 	}
 	if end == 0 {
-		return false, r
+		return false, replay
 	}
 	if _, err := strconv.ParseUint(string(trimmed[:end]), 16, 64); err != nil {
-		return false, r
+		return false, replay
 	}
-	return true, &prependReadCloser{
-		Reader: io.MultiReader(bytes.NewReader(line), br),
-		Closer: r,
-	}
+	return true, replay
 }
 
 func isHex(b byte) bool {

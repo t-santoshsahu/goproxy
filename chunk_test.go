@@ -201,8 +201,29 @@ func TestBodyLooksChunked(t *testing.T) {
 		t.Fatalf("replay mismatch: got %q", out)
 	}
 
-	ok, _ = bodyLooksChunked(io.NopCloser(strings.NewReader("plain text")))
+	plain := "plain text"
+	ok, body = bodyLooksChunked(io.NopCloser(strings.NewReader(plain)))
 	if ok {
 		t.Fatal("expected false for plain text")
+	}
+	out, err = io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != plain {
+		t.Fatalf("plain text replay mismatch: got %q want %q", out, plain)
+	}
+
+	jsonBody := `{"name":"abc"}`
+	ok, body = bodyLooksChunked(io.NopCloser(strings.NewReader(jsonBody)))
+	if ok {
+		t.Fatal("expected false for JSON without newline")
+	}
+	out, err = io.ReadAll(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != jsonBody {
+		t.Fatalf("JSON replay mismatch: got %q want %q", out, jsonBody)
 	}
 }
