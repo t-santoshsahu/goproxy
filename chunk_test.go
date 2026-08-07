@@ -166,6 +166,27 @@ func TestWrapChunkHookBodyWithHandler(t *testing.T) {
 	}
 }
 
+func TestWrapChunkHookBodyNonChunkedJSONReplay(t *testing.T) {
+	proxy := NewProxyHttpServer()
+	proxy.OnRequest().OnChunkFunc(func(event *ChunkEvent, ctx *ProxyCtx) (*ChunkEvent, error) {
+		return event, nil
+	})
+
+	ctx := &ProxyCtx{Proxy: proxy}
+	jsonBody := `{"name":"abc"}`
+	body := io.NopCloser(strings.NewReader(jsonBody))
+	h := make(http.Header)
+
+	out := proxy.wrapChunkHookBody(body, h, nil, ctx, ChunkFromClient)
+	got, err := io.ReadAll(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != jsonBody {
+		t.Fatalf("got %q want %q", got, jsonBody)
+	}
+}
+
 func TestChunkHookReadCloserSkipsNilDataChunk(t *testing.T) {
 	raw := "3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n"
 	proxy := NewProxyHttpServer()

@@ -189,10 +189,10 @@ func (proxy *ProxyHttpServer) wrapChunkHookBody(body io.ReadCloser, header http.
 
 	if !isChunkedTransferEncoding(header, te) {
 		ok, newBody := bodyLooksChunked(body)
+		body = newBody
 		if !ok {
 			return body
 		}
-		body = newBody
 	}
 	return newChunkHookReadCloser(body, proxy, ctx, dir)
 }
